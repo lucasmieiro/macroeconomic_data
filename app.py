@@ -10,7 +10,7 @@ import numpy as np
 import requests
 import streamlit as st
 import plotly.express as px
-
+import time
 # -----------------------------
 # Page / Theme
 # -----------------------------
@@ -117,45 +117,59 @@ def fetch_fred(series_id: str, start: Optional[str], end: Optional[str]) -> pd.D
         return pd.DataFrame(columns=["value", "series"])
 
 @st.cache_data(show_spinner=False)
-def fetch_bcb_sgs(series_id: int, start: Optional[str], end: Optional[str]) -> pd.DataFrame:
+def fetch_bcb_sgs(series_id: int, start: Optional[str], end: Optional[str],
+                  tries: int = 3, timeout: int = 60) -> pd.DataFrame:
     """
-    Fetch a Banco Central do Brasil SGS series.
-    The API supports optional date filters in the URL.
-    IMPORTANT: For daily series, SGS only allows a 10-year window — we clamp if needed.
+    Fetch a Banco Central do Brasil SGS series with retries, longer timeout, and
+    a 10-year clamp for daily series (as required by SGS).
     """
-    try:
-        end_dt = pd.to_datetime(end) if end else pd.Timestamp.today()
-        start_dt = pd.to_datetime(start) if start else end_dt - pd.Timedelta(days=3650)
-        # Clamp to max 10 years (3650 days) to satisfy daily-series policy
-        if (end_dt - start_dt).days > 3650:
-            start_dt = end_dt - pd.Timedelta(days=3650)
-        if start_dt > end_dt:
-            start_dt = end_dt - pd.Timedelta(days=30)  # last 30 days fallback
+    # compute start/end and clamp to 10 years (daily-series rule)
+    end_dt = pd.to_datetime(end) if end else pd.Timestamp.today()
+    start_dt = pd.to_datetime(start) if start else end_dt - pd.Timedelta(days=3650)
+    if (end_dt - start_dt).days > 3650:
+        start_dt = end_dt - pd.Timedelta(days=3650)
+    if start_dt > end_dt:
+        start_dt = end_dt - pd.Timedelta(days=30)
 
-        start_d = start_dt.strftime("%d/%m/%Y")
-        end_d   = end_dt.strftime("%d/%m/%Y")
-        url = (
-            f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{series_id}/dados"
-            f"?formato=json&dataInicial={start_d}&dataFinal={end_d}"
-        )
-        resp = requests.get(
-            url,
-            headers={"Accept": "application/json; charset=utf-8", "User-Agent": UA_HEADERS["User-Agent"]},
-            timeout=30
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        df = pd.DataFrame(data)
-        if df.empty or "data" not in df or "valor" not in df:
+    start_d = start_dt.strftime("%d/%m/%Y")
+    end_d   = end_dt.strftime("%d/%m/%Y")
+    url = (
+        f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{series_id}/dados"
+        f"?formato=json&dataInicial={start_d}&dataFinal={end_d}"
+    )
+
+    last_err = None
+    for i in range(tries):
+        try:
+            resp = requests.get(
+                url,
+                headers={
+                    "Accept": "application/json; charset=utf-8",
+                    "User-Agent": UA_HEADERS["User-Agent"],
+                },
+                timeout=timeout,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            df = pd.DataFrame(data)
+            if df.empty or "data" not in df or "valor" not in df:
+                return pd.DataFrame(columns=["value", "series"])
+            df["date"] = pd.to_datetime(df["data"], format="%d/%m/%Y", errors="coerce")
+            df["value"] = pd.to_numeric(df["valor"].str.replace(",", "."), errors="coerce")
+            df = df[["date", "value"]].dropna().set_index("date").sort_index()
+            df["series"] = str(series_id)
+            return df
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
+            last_err = e
+            # exponential backoff: 1.5s, 3s, 6s...
+            time.sleep(1.5 * (2 ** i))
+        except Exception as e:
+            st.warning(f"BCB SGS fetch failed for `{series_id}`: {e}")
             return pd.DataFrame(columns=["value", "series"])
-        df["date"] = pd.to_datetime(df["data"], format="%d/%m/%Y", errors="coerce")
-        df["value"] = pd.to_numeric(df["valor"].str.replace(",", "."), errors="coerce")
-        df = df[["date", "value"]].dropna().set_index("date").sort_index()
-        df["series"] = str(series_id)
-        return df
-    except Exception as e:
-        st.warning(f"BCB SGS fetch failed for `{series_id}`: {e}")
-        return pd.DataFrame(columns=["value", "series"])
+
+    st.warning(f"BCB SGS fetch failed for `{series_id}` after {tries} attempts: {last_err}")
+    return pd.DataFrame(columns=["value", "series"])
+
 
 @st.cache_data(show_spinner=False)
 def fetch_worldbank(indicator: str, country_code: str = "USA", start_year: int = 1990, end_year: Optional[int] = None) -> pd.DataFrame:
@@ -310,19 +324,21 @@ with tabs[0]:
         return float(df.loc[last_date, "value"]), last_date.strftime("%Y-%m-%d")
 
     # NOTE: This dict lives under the 'with tabs[0]:' indentation (8 spaces)
-    metrics = {
+        metrics = {
         "Fed Funds (USA, %)": df_fedfunds,
         "CPI (USA, index)": df_cpi_us,
         "GDP (USA, $tn)": scale_df(df_gdp_us, 1e3) if not df_gdp_us.empty else df_gdp_us,
         "Unemp (USA, %)": df_unrate_us,
         "Retail (USA, $m)": df_retail_us,
 
-        "Selic (BRA, % a.a.)": df_selic,
-        "IPCA (BRA, % m/m)": df_ipca,
-        "GDP (BRA, LCU)": df_gdp_br,
-        "Unemp (BRA, %)": df_unemp_br,
-        "Retail (BRA, index)": df_retail_br,
+        # Brazil – friendlier labels
+        "Selic (meta, % a.a.)": df_selic,
+        "IPCA mensal (% m/m)": df_ipca,
+        "PIB Brasil (R$ correntes)": df_gdp_br,
+        "Desemprego (%, IBGE)": df_unemp_br,
+        "Varejo – índice (PMC)": df_retail_br,
     }
+
 
     # display metrics in 2 rows
     items = list(metrics.items())
@@ -357,27 +373,31 @@ with tabs[1]:
 # Brazil Tab
 # -----------------------------
 with tabs[2]:
-    st.subheader("Brazil")
+    st.subheader("Brasil")
     if not df_selic.empty:
-        st.plotly_chart(px_line_common(df_selic, "Selic (Target, % a.a.)", "% a.a."), use_container_width=True)
+        st.plotly_chart(px_line_common(df_selic, "Selic – taxa meta (% a.a.)", "% a.a."), use_container_width=True)
     else:
-        st.info("Selic: adjust SGS ID in the sidebar (e.g., 432 for target).")
+        st.info("Selic: ajuste o ID da série SGS na barra lateral (ex.: 432 = meta diária).")
+
     if not df_ipca.empty:
-        st.plotly_chart(px_line_common(df_ipca, "IPCA (m/m, %)", "% m/m"), use_container_width=True)
+        st.plotly_chart(px_line_common(df_ipca, "IPCA – variação mensal (%)", "% m/m"), use_container_width=True)
     else:
-        st.info("IPCA: adjust SGS ID in the sidebar (e.g., 433 for monthly % change).")
+        st.info("IPCA: ajuste o ID da série SGS (ex.: 433 = var. mensal).")
+
     if not df_gdp_br.empty:
-        st.plotly_chart(px_line_common(df_gdp_br, "GDP (current LCU, annual)", "LCU"), use_container_width=True)
+        st.plotly_chart(px_line_common(df_gdp_br, "PIB (preços correntes, anual)", "R$ correntes"), use_container_width=True)
     else:
-        st.info("GDP (BRA): check World Bank indicator (default: NY.GDP.MKTP.CN).")
+        st.info("PIB (Brasil): verifique o indicador do World Bank (padrão: NY.GDP.MKTP.CN).")
+
     if not df_unemp_br.empty:
-        st.plotly_chart(px_line_common(df_unemp_br, "Unemployment Rate (annual, % of labor force)", "%"), use_container_width=True)
+        st.plotly_chart(px_line_common(df_unemp_br, "Desemprego – taxa anual (%)", "% da força de trabalho"), use_container_width=True)
     else:
-        st.info("Unemployment (BRA): check World Bank indicator (default: SL.UEM.TOTL.ZS).")
+        st.info("Desemprego (Brasil): indicador padrão WB: SL.UEM.TOTL.ZS.")
+
     if not df_retail_br.empty:
-        st.plotly_chart(px_line_common(df_retail_br, "Retail Sales (Index)", "Index"), use_container_width=True)
+        st.plotly_chart(px_line_common(df_retail_br, "Varejo (PMC) – índice", "Índice"), use_container_width=True)
     else:
-        st.info("Retail (BRA): adjust SGS ID in the sidebar. A common choice: 1552 (PMC volume index).")
+        st.info("Varejo (PMC): ajuste o ID da série SGS (ex.: 1552).")
 
 # -----------------------------
 # Downloads Tab
