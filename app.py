@@ -301,10 +301,10 @@ with tabs[0]:
         last_date = df.index.max()
         return float(df.loc[last_date, "value"]), last_date.strftime("%Y-%m-%d")
 
-    metrics = {
+     metrics = {
         "Fed Funds (USA, %)": df_fedfunds,
         "CPI (USA, index)": df_cpi_us,
-        "GDP (USA, $tn)": scale_df(df_gdp_us, 1e3) if not df_gdp_us.empty else df_gdp_us
+        "GDP (USA, $tn)": scale_df(df_gdp_us, 1e3) if not df_gdp_us.empty else df_gdp_us,  # display in $ trillions
         "Unemp (USA, %)": df_unrate_us,
         "Retail (USA, $m)": df_retail_us,
 
@@ -314,6 +314,7 @@ with tabs[0]:
         "Unemp (BRA, %)": df_unemp_br,
         "Retail (BRA, index)": df_retail_br,
     }
+
 
     # display metrics in 2 rows
     items = list(metrics.items())
