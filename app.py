@@ -539,7 +539,12 @@ with tabs[3]:
     st.markdown("**Per-series CSVs**")
     for name, df in labeled.items():
         if df is not None and not df.empty:
-            csv_bytes = df_to_csv_bytes(df[[df.columns[-1]]])  # ensure single data col
+            if "value" in df.columns:
+    df_out = df[["value"]].rename(columns={"value": name})
+            else:
+    df_out = df
+csv_bytes = df_to_csv_bytes(df_out)
+  # ensure single data col
             st.download_button(
                 label=f"⬇️ Download {name}.csv",
                 data=csv_bytes,
