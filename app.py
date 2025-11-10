@@ -8,7 +8,6 @@ import pandas as pd
 import numpy as np
 import requests
 import streamlit as st
-from pandas_datareader import data as pdr
 import plotly.express as px
 
 # -----------------------------
@@ -44,13 +43,28 @@ st.markdown(
 
 @st.cache_data(show_spinner=False)
 def fetch_fred(series_id: str, start: Optional[str]) -> pd.DataFrame:
-    """Fetch a FRED series with pandas_datareader."""
+    """
+    Fetch a FRED series via the public fredgraph.csv endpoint (no API key).
+    Example: https://fred.stlouisfed.org/graph/fredgraph.csv?id=UNRATE
+    """
+    import urllib.parse
+    base = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+    url = f"{base}?id={urllib.parse.quote(series_id)}"
     try:
-        s = pdr.DataReader(series_id, "fred", start=start)
-        s = s.rename(columns={series_id: "value"})
-        s.index = pd.to_datetime(s.index)
-        s["series"] = series_id
-        return s.dropna()
+        df = pd.read_csv(url)
+        # Expect columns: DATE, <SERIESID>
+        value_cols = [c for c in df.columns if c.upper() != "DATE"]
+        if not value_cols:
+            return pd.DataFrame(columns=["value", "series"])
+        value_col = value_cols[0]
+        df["date"] = pd.to_datetime(df["DATE"], errors="coerce")
+        df["value"] = pd.to_numeric(df[value_col], errors="coerce")
+        df = df[["date", "value"]].dropna()
+        if start:
+            df = df[df["date"] >= pd.to_datetime(start)]
+        df = df.set_index("date")
+        df["series"] = series_id
+        return df
     except Exception as e:
         st.warning(f"FRED fetch failed for `{series_id}`: {e}")
         return pd.DataFrame(columns=["value", "series"])
@@ -72,7 +86,6 @@ def fetch_bcb_sgs(series_id: int, start: Optional[str]) -> pd.DataFrame:
             return pd.DataFrame(columns=["value", "series"])
         # SGS returns 'data' (dd/mm/YYYY) and 'valor' strings
         df["date"] = pd.to_datetime(df["data"], format="%d/%m/%Y", errors="coerce")
-        # 'valor' can come with comma decimal separator
         df["value"] = pd.to_numeric(df["valor"].str.replace(",", "."), errors="coerce")
         df = df[["date", "value"]].dropna()
         if start:
@@ -178,7 +191,7 @@ st.caption("Bloomberg-style dark theme • common chart design • CSV downloads
 # Load Data
 # -----------------------------
 with st.spinner("Fetching data..."):
-    # USA (FRED)
+    # USA (FRED via fredgraph.csv)
     df_fedfunds = fetch_fred(us_series["Fed Funds (USA)"], start_str)
     df_cpi_us = fetch_fred(us_series["CPI (USA)"], start_str)
     df_gdp_us = fetch_fred(us_series["GDP (USA, nominal)"], start_str)
@@ -349,7 +362,7 @@ st.markdown("---")
 with st.expander("ℹ️ Sources & tips"):
     st.markdown(
         """
-- **USA (FRED)** via `pandas_datareader`: FEDFUNDS, CPIAUCSL, GDP, UNRATE, RSAFS.
+- **USA (FRED)** via public **fredgraph.csv** endpoint: no API key required (e.g., FEDFUNDS, CPIAUCSL, GDP, UNRATE, RSAFS).
 - **Brazil (BCB SGS)** for Selic & IPCA; **World Bank** for GDP & Unemployment; **SGS** for retail index.
 - If a Brazilian series looks off, swap the SGS IDs in the sidebar (there are variants).
 - The app caches results. Change a series ID or date to refresh that fetch.
