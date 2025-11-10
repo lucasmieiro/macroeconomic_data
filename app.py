@@ -47,19 +47,17 @@ UA_HEADERS = {
     "Accept": "text/csv,application/json;q=0.9,*/*;q=0.8",
 }
 
-
 @st.cache_data(show_spinner=False)
 def fetch_fred(series_id: str, start: Optional[str], end: Optional[str]) -> pd.DataFrame:
     """
     Fetch US series from FRED.
     Priority:
-      1) Official FRED API (requires free API key) if available in st.secrets["FRED_API_KEY"] or sidebar field.
-      2) fredgraph.csv fallback (no key). Handles 'DATE' or 'observation_date' column names.
+      1) Official FRED API (requires free API key) if provided (st.secrets['FRED_API_KEY'] or sidebar).
+      2) fredgraph.csv fallback (no key). Handles 'DATE' or 'observation_date'.
     """
     api_key = st.session_state.get("fred_api_key") or st.secrets.get("FRED_API_KEY", None)
     try:
         if api_key:
-            # Official API
             params = {
                 "series_id": series_id,
                 "api_key": api_key,
@@ -77,7 +75,6 @@ def fetch_fred(series_id: str, start: Optional[str], end: Optional[str]) -> pd.D
             if not rows:
                 return pd.DataFrame(columns=["value", "series"])
             df = pd.DataFrame(rows)
-            # columns include 'date' and 'value'
             df["date"] = pd.to_datetime(df["date"], errors="coerce")
             df["value"] = pd.to_numeric(df["value"], errors="coerce")
             df = df[["date", "value"]].dropna()
@@ -119,23 +116,37 @@ def fetch_fred(series_id: str, start: Optional[str], end: Optional[str]) -> pd.D
         st.warning(f"FRED fetch failed for `{series_id}`: {e}")
         return pd.DataFrame(columns=["value", "series"])
 
-
 @st.cache_data(show_spinner=False)
 def fetch_bcb_sgs(series_id: int, start: Optional[str], end: Optional[str]) -> pd.DataFrame:
     """
     Fetch a Banco Central do Brasil SGS series.
-    The API supports optional date filters in the URL. We pass a very wide range by default to avoid 406 issues.
+    The API supports optional date filters in the URL.
+    IMPORTANT: For daily series, SGS only allows a 10-year window — we clamp if needed.
     """
-    # Build URL with explicit date range (DD/MM/YYYY)
-    start_d = pd.to_datetime(start).strftime("%d/%m/%Y") if start else "01/01/1900"
-    end_d   = pd.to_datetime(end).strftime("%d/%m/%Y") if end else pd.Timestamp.today().strftime("%d/%m/%Y")
-    url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{series_id}/dados?formato=json&dataInicial={start_d}&dataFinal={end_d}"
     try:
-        resp = requests.get(url, headers={"Accept": "application/json; charset=utf-8", "User-Agent": UA_HEADERS["User-Agent"]}, timeout=30)
+        end_dt = pd.to_datetime(end) if end else pd.Timestamp.today()
+        start_dt = pd.to_datetime(start) if start else end_dt - pd.Timedelta(days=3650)
+        # Clamp to max 10 years (3650 days) to satisfy daily-series policy
+        if (end_dt - start_dt).days > 3650:
+            start_dt = end_dt - pd.Timedelta(days=3650)
+        if start_dt > end_dt:
+            start_dt = end_dt - pd.Timedelta(days=30)  # last 30 days fallback
+
+        start_d = start_dt.strftime("%d/%m/%Y")
+        end_d   = end_dt.strftime("%d/%m/%Y")
+        url = (
+            f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{series_id}/dados"
+            f"?formato=json&dataInicial={start_d}&dataFinal={end_d}"
+        )
+        resp = requests.get(
+            url,
+            headers={"Accept": "application/json; charset=utf-8", "User-Agent": UA_HEADERS["User-Agent"]},
+            timeout=30
+        )
         resp.raise_for_status()
         data = resp.json()
         df = pd.DataFrame(data)
-        if df.empty:
+        if df.empty or "data" not in df or "valor" not in df:
             return pd.DataFrame(columns=["value", "series"])
         df["date"] = pd.to_datetime(df["data"], format="%d/%m/%Y", errors="coerce")
         df["value"] = pd.to_numeric(df["valor"].str.replace(",", "."), errors="coerce")
@@ -202,14 +213,12 @@ def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=True).encode("utf-8")
 
 def scale_df(df: pd.DataFrame, factor: float) -> pd.DataFrame:
-    """Return a copy where only the numeric 'value' column is scaled by 1/factor.
-    Keeps the 'series' column intact.
-    """
+    """Scale only the 'value' column by (1/factor); keep 'series' as-is."""
     if df is None or df.empty:
         return df
     out = df.copy()
-    if 'value' in out.columns:
-        out['value'] = pd.to_numeric(out['value'], errors='coerce') / factor
+    if "value" in out.columns:
+        out["value"] = pd.to_numeric(out["value"], errors="coerce") / factor
     return out
 
 # -----------------------------
@@ -223,13 +232,12 @@ default_end = st.sidebar.date_input("End date", value=date.today())
 start_str = default_start.isoformat()
 end_str = default_end.isoformat()
 
-
 st.sidebar.markdown("**Optional: FRED API key**")
-fred_key = st.sidebar.text_input("Enter FRED API key (free)", value="", type="password")
+fred_key = st.sidebar.text_input("Enter FRED API key (free)", value=st.secrets.get("FRED_API_KEY", ""), type="password")
 if fred_key:
     st.session_state["fred_api_key"] = fred_key
 st.sidebar.markdown("---")
-st.sidebar.markdown("---")
+
 st.sidebar.markdown("**Series (you can change these):**")
 
 # USA (FRED) ids
@@ -263,7 +271,7 @@ st.caption("Bloomberg-style dark theme • common chart design • CSV downloads
 # Load Data
 # -----------------------------
 with st.spinner("Fetching data..."):
-    # USA (FRED via fredgraph.csv)
+    # USA (FRED via API or CSV)
     df_fedfunds = fetch_fred(us_series["Fed Funds (USA)"], start_str, end_str)
     df_cpi_us = fetch_fred(us_series["CPI (USA)"], start_str, end_str)
     df_gdp_us = fetch_fred(us_series["GDP (USA, nominal)"], start_str, end_str)
@@ -301,21 +309,20 @@ with tabs[0]:
         last_date = df.index.max()
         return float(df.loc[last_date, "value"]), last_date.strftime("%Y-%m-%d")
 
-        metrics = {
-            "Fed Funds (USA, %)": df_fedfunds,
-            "CPI (USA, index)": df_cpi_us,
-            "GDP (USA, $tn)": scale_df(df_gdp_us, 1e3) if not df_gdp_us.empty else df_gdp_us,  # display in $ trillions
-            "Unemp (USA, %)": df_unrate_us,
-            "Retail (USA, $m)": df_retail_us,
+    # NOTE: This dict lives under the 'with tabs[0]:' indentation (8 spaces)
+    metrics = {
+        "Fed Funds (USA, %)": df_fedfunds,
+        "CPI (USA, index)": df_cpi_us,
+        "GDP (USA, $tn)": scale_df(df_gdp_us, 1e3) if not df_gdp_us.empty else df_gdp_us,
+        "Unemp (USA, %)": df_unrate_us,
+        "Retail (USA, $m)": df_retail_us,
 
-            "Selic (BRA, % a.a.)": df_selic,
-            "IPCA (BRA, % m/m)": df_ipca,
-            "GDP (BRA, LCU)": df_gdp_br,
-            "Unemp (BRA, %)": df_unemp_br,
-            "Retail (BRA, index)": df_retail_br,
-        }
-
-
+        "Selic (BRA, % a.a.)": df_selic,
+        "IPCA (BRA, % m/m)": df_ipca,
+        "GDP (BRA, LCU)": df_gdp_br,
+        "Unemp (BRA, %)": df_unemp_br,
+        "Retail (BRA, index)": df_retail_br,
+    }
 
     # display metrics in 2 rows
     items = list(metrics.items())
@@ -434,10 +441,9 @@ st.markdown("---")
 with st.expander("ℹ️ Sources & tips"):
     st.markdown(
         """
-- **USA (FRED)** via public **fredgraph.csv** endpoint: no API key required (e.g., FEDFUNDS, CPIAUCSL, GDP, UNRATE, RSAFS).
-- **Brazil (BCB SGS)** for Selic & IPCA; **World Bank** for GDP & Unemployment; **SGS** for retail index.
-- If a Brazilian series looks off, swap the SGS IDs in the sidebar (there are variants).
-- Use the Start/End date pickers (now includes **today**) to filter the charts and CSVs.
+- **USA (FRED)** via official API (if key provided) or public **fredgraph.csv** fallback.
+- **Brazil (BCB SGS)** for Selic & IPCA (10-year window clamp for daily series); **World Bank** for GDP & Unemployment; **SGS** for retail index.
+- Use the Start/End date pickers (End defaults to **today**) to filter the charts and CSVs.
 - The app caches results. Change a series ID or date to refresh that fetch.
 """
     )
