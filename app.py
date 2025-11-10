@@ -1,0 +1,357 @@
+# app.py
+# Streamlit macro dashboard (USA + Brazil) with Bloomberg-like look, CSV download
+# Run locally: streamlit run app.py
+
+from typing import Optional
+from datetime import date
+import pandas as pd
+import numpy as np
+import requests
+import streamlit as st
+from pandas_datareader import data as pdr
+import plotly.express as px
+
+# -----------------------------
+# Page / Theme
+# -----------------------------
+st.set_page_config(
+    page_title="Macro Dashboard – USA & Brazil",
+    page_icon="📈",
+    layout="wide",
+)
+
+# Bloomberg-ish minimal CSS tweaks for a crisp dark look
+st.markdown(
+    """
+    <style>
+      :root {
+        --bloom-font: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      }
+      .block-container { padding-top: 1rem; padding-bottom: 2rem; }
+      h1, h2, h3 { letter-spacing: 0.2px; }
+      .metric-row { gap: 1rem; }
+      .download-row { display: flex; gap: 0.6rem; flex-wrap: wrap; }
+      .stPlotlyChart { border-radius: 10px; }
+      .css-zt5igj, .e1f1d6gn4 { font-family: var(--bloom-font) !important; }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+# -----------------------------
+# Helpers
+# -----------------------------
+
+@st.cache_data(show_spinner=False)
+def fetch_fred(series_id: str, start: Optional[str]) -> pd.DataFrame:
+    """Fetch a FRED series with pandas_datareader."""
+    try:
+        s = pdr.DataReader(series_id, "fred", start=start)
+        s = s.rename(columns={series_id: "value"})
+        s.index = pd.to_datetime(s.index)
+        s["series"] = series_id
+        return s.dropna()
+    except Exception as e:
+        st.warning(f"FRED fetch failed for `{series_id}`: {e}")
+        return pd.DataFrame(columns=["value", "series"])
+
+@st.cache_data(show_spinner=False)
+def fetch_bcb_sgs(series_id: int, start: Optional[str]) -> pd.DataFrame:
+    """
+    Fetch a Banco Central do Brasil SGS series.
+    Endpoint: https://api.bcb.gov.br/dados/serie/bcdata.sgs.{series_id}/dados?formato=json
+    Optional start parameter handled by filtering after fetch.
+    """
+    url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{series_id}/dados?formato=json"
+    try:
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        df = pd.DataFrame(data)
+        if df.empty:
+            return pd.DataFrame(columns=["value", "series"])
+        # SGS returns 'data' (dd/mm/YYYY) and 'valor' strings
+        df["date"] = pd.to_datetime(df["data"], format="%d/%m/%Y", errors="coerce")
+        # 'valor' can come with comma decimal separator
+        df["value"] = pd.to_numeric(df["valor"].str.replace(",", "."), errors="coerce")
+        df = df[["date", "value"]].dropna()
+        if start:
+            df = df[df["date"] >= pd.to_datetime(start)]
+        df = df.set_index("date")
+        df["series"] = str(series_id)
+        return df
+    except Exception as e:
+        st.warning(f"BCB SGS fetch failed for `{series_id}`: {e}")
+        return pd.DataFrame(columns=["value", "series"])
+
+@st.cache_data(show_spinner=False)
+def fetch_worldbank(indicator: str, country_code: str = "USA", start_year: int = 1990) -> pd.DataFrame:
+    """
+    Fetch World Bank series: indicator (e.g., 'NY.GDP.MKTP.CN', 'SL.UEM.TOTL.ZS'), country code (e.g., 'USA','BRA').
+    """
+    try:
+        url = f"https://api.worldbank.org/v2/country/{country_code}/indicator/{indicator}?format=json&per_page=20000"
+        r = requests.get(url, timeout=25)
+        r.raise_for_status()
+        payload = r.json()
+        if not isinstance(payload, list) or len(payload) < 2:
+            raise ValueError("Unexpected World Bank response")
+        rows = payload[1] or []
+        df = pd.DataFrame(rows)
+        if df.empty or "date" not in df or "value" not in df:
+            return pd.DataFrame(columns=["value", "series"])
+        df = df[["date", "value"]].dropna()
+        # annual -> end-of-year timestamp
+        df["date"] = pd.to_datetime(df["date"].astype(str) + "-12-31", errors="coerce")
+        df["value"] = pd.to_numeric(df["value"], errors="coerce")
+        df = df.dropna().sort_values("date")
+        df = df[df["date"].dt.year >= start_year].set_index("date")
+        df["series"] = indicator
+        return df
+    except Exception as e:
+        st.warning(f"World Bank fetch failed for `{country_code}:{indicator}`: {e}")
+        return pd.DataFrame(columns=["value", "series"])
+
+def px_line_common(df: pd.DataFrame, title: str, y_label: str):
+    fig = px.line(
+        df.reset_index(),
+        x="date",
+        y="value",
+        title=title,
+        template="plotly_dark",
+    )
+    fig.update_layout(
+        height=420,
+        margin=dict(l=10, r=10, t=60, b=10),
+        xaxis_title=None,
+        yaxis_title=y_label,
+        font=dict(family="ui-monospace", size=13),
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    fig.update_traces(line=dict(width=2))
+    return fig
+
+def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=True).encode("utf-8")
+
+# -----------------------------
+# Sidebar Controls
+# -----------------------------
+st.sidebar.title("⚙️ Settings")
+
+st.sidebar.markdown("**Date filter**")
+default_start = st.sidebar.date_input("Start date", value=date(2010, 1, 1))
+start_str = default_start.isoformat()
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Series (you can change these):**")
+
+# USA (FRED) ids
+us_series = {
+    "Fed Funds (USA)": st.sidebar.text_input("FRED Fed Funds ID", value="FEDFUNDS"),
+    "CPI (USA)": st.sidebar.text_input("FRED CPI ID", value="CPIAUCSL"),
+    "GDP (USA, nominal)": st.sidebar.text_input("FRED GDP ID", value="GDP"),
+    "Unemployment Rate (USA)": st.sidebar.text_input("FRED Unemployment ID", value="UNRATE"),
+    "Retail Sales (USA)": st.sidebar.text_input("FRED Retail Sales ID", value="RSAFS"),
+}
+
+# Brazil (SGS / World Bank) defaults
+brazil_sgs_selic = st.sidebar.text_input("BCB SGS Selic (target) ID", value="432")
+brazil_sgs_ipca = st.sidebar.text_input("BCB SGS IPCA m/m % ID", value="433")
+brazil_sgs_retail = st.sidebar.text_input("BCB SGS Retail Sales ID", value="1552")
+wb_gdp_bra = st.sidebar.text_input("World Bank GDP (BRA) indicator", value="NY.GDP.MKTP.CN")
+wb_unemp_bra = st.sidebar.text_input("World Bank Unemployment (BRA) indicator", value="SL.UEM.TOTL.ZS")
+
+mobile_compact = st.sidebar.checkbox("Compact charts for mobile", value=True)
+
+st.sidebar.markdown("---")
+st.sidebar.caption("Tip: If any series fails, tweak IDs here. The app will keep running.")
+
+# -----------------------------
+# Title & Intro
+# -----------------------------
+st.title("📊 Macro Dashboard — USA & Brazil")
+st.caption("Bloomberg-style dark theme • common chart design • CSV downloads • mobile-friendly")
+
+# -----------------------------
+# Load Data
+# -----------------------------
+with st.spinner("Fetching data..."):
+    # USA (FRED)
+    df_fedfunds = fetch_fred(us_series["Fed Funds (USA)"], start_str)
+    df_cpi_us = fetch_fred(us_series["CPI (USA)"], start_str)
+    df_gdp_us = fetch_fred(us_series["GDP (USA, nominal)"], start_str)
+    df_unrate_us = fetch_fred(us_series["Unemployment Rate (USA)"], start_str)
+    df_retail_us = fetch_fred(us_series["Retail Sales (USA)"], start_str)
+
+    # Brazil (BCB SGS + World Bank)
+    df_selic = fetch_bcb_sgs(int(brazil_sgs_selic), start_str) if brazil_sgs_selic.isdigit() else pd.DataFrame()
+    df_ipca = fetch_bcb_sgs(int(brazil_sgs_ipca), start_str) if brazil_sgs_ipca.isdigit() else pd.DataFrame()
+    df_retail_br = fetch_bcb_sgs(int(brazil_sgs_retail), start_str) if brazil_sgs_retail.isdigit() else pd.DataFrame()
+
+    df_gdp_br = fetch_worldbank(wb_gdp_bra, "BRA", start_year=pd.to_datetime(start_str).year)
+    df_unemp_br = fetch_worldbank(wb_unemp_bra, "BRA", start_year=pd.to_datetime(start_str).year)
+
+# -----------------------------
+# Layout
+# -----------------------------
+tabs = st.tabs([
+    "Overview",
+    "USA",
+    "Brazil",
+    "Downloads"
+])
+
+# -----------------------------
+# Overview Tab
+# -----------------------------
+with tabs[0]:
+    st.subheader("Overview")
+    st.markdown("Latest prints (last available):")
+
+    def latest_value(df: pd.DataFrame):
+        if df is None or df.empty:
+            return np.nan, "—"
+        last_date = df.index.max()
+        return float(df.loc[last_date, "value"]), last_date.strftime("%Y-%m-%d")
+
+    metrics = {
+        "Fed Funds (USA, %)": df_fedfunds,
+        "CPI (USA, index)": df_cpi_us,
+        "GDP (USA, $bn)": (df_gdp_us / 1e3) if not df_gdp_us.empty else df_gdp_us,  # display in $ trillions
+        "Unemp (USA, %)": df_unrate_us,
+        "Retail (USA, $m)": df_retail_us,
+
+        "Selic (BRA, % a.a.)": df_selic,
+        "IPCA (BRA, % m/m)": df_ipca,
+        "GDP (BRA, LCU)": df_gdp_br,
+        "Unemp (BRA, %)": df_unemp_br,
+        "Retail (BRA, index)": df_retail_br,
+    }
+
+    # display metrics in 2 rows
+    items = list(metrics.items())
+    half = int(np.ceil(len(items) / 2))
+    for row in [items[:half], items[half:]]:
+        cols = st.columns(len(row))
+        for (label, df_), c in zip(row, cols):
+            with c:
+                val, when = latest_value(df_)
+                if np.isnan(val):
+                    st.metric(label, "—", help="No data")
+                else:
+                    st.metric(label, f"{val:,.2f}", help=f"Last: {when}")
+
+# -----------------------------
+# USA Tab
+# -----------------------------
+with tabs[1]:
+    st.subheader("United States")
+    if not df_fedfunds.empty:
+        st.plotly_chart(px_line_common(df_fedfunds, "Fed Funds Rate (Effective)", "%"), use_container_width=True)
+    if not df_cpi_us.empty:
+        st.plotly_chart(px_line_common(df_cpi_us, "CPI (1982–84=100)", "Index"), use_container_width=True)
+    if not df_gdp_us.empty:
+        st.plotly_chart(px_line_common(df_gdp_us, "GDP (Nominal)", "USD (Billions)"), use_container_width=True)
+    if not df_unrate_us.empty:
+        st.plotly_chart(px_line_common(df_unrate_us, "Unemployment Rate", "%"), use_container_width=True)
+    if not df_retail_us.empty:
+        st.plotly_chart(px_line_common(df_retail_us, "Retail & Food Services Sales", "USD (Millions)"), use_container_width=True)
+
+# -----------------------------
+# Brazil Tab
+# -----------------------------
+with tabs[2]:
+    st.subheader("Brazil")
+    if not df_selic.empty:
+        st.plotly_chart(px_line_common(df_selic, "Selic (Target, % a.a.)", "% a.a."), use_container_width=True)
+    else:
+        st.info("Selic: adjust SGS ID in the sidebar (e.g., 432 for target).")
+    if not df_ipca.empty:
+        st.plotly_chart(px_line_common(df_ipca, "IPCA (m/m, %)", "% m/m"), use_container_width=True)
+    else:
+        st.info("IPCA: adjust SGS ID in the sidebar (e.g., 433 for monthly % change).")
+    if not df_gdp_br.empty:
+        st.plotly_chart(px_line_common(df_gdp_br, "GDP (current LCU, annual)", "LCU"), use_container_width=True)
+    else:
+        st.info("GDP (BRA): check World Bank indicator (default: NY.GDP.MKTP.CN).")
+    if not df_unemp_br.empty:
+        st.plotly_chart(px_line_common(df_unemp_br, "Unemployment Rate (annual, % of labor force)", "%"), use_container_width=True)
+    else:
+        st.info("Unemployment (BRA): check World Bank indicator (default: SL.UEM.TOTL.ZS).")
+    if not df_retail_br.empty:
+        st.plotly_chart(px_line_common(df_retail_br, "Retail Sales (Index)", "Index"), use_container_width=True)
+    else:
+        st.info("Retail (BRA): adjust SGS ID in the sidebar. A common choice: 1552 (PMC volume index).")
+
+# -----------------------------
+# Downloads Tab
+# -----------------------------
+with tabs[3]:
+    st.subheader("Downloads")
+    st.write("Download clean CSVs for each series, or a combined file with all columns aligned by date.")
+
+    labeled = {
+        "fedfunds_usa": df_fedfunds.rename(columns={"value": "fedfunds_usa"}),
+        "cpi_usa": df_cpi_us.rename(columns={"value": "cpi_usa"}),
+        "gdp_usa": df_gdp_us.rename(columns={"value": "gdp_usa"}),
+        "unemp_usa": df_unrate_us.rename(columns={"value": "unemp_usa"}),
+        "retail_usa": df_retail_us.rename(columns={"value": "retail_usa"}),
+
+        "selic_bra": df_selic.rename(columns={"value": "selic_bra"}),
+        "ipca_bra": df_ipca.rename(columns={"value": "ipca_bra"}),
+        "gdp_bra": df_gdp_br.rename(columns={"value": "gdp_bra"}),
+        "unemp_bra": df_unemp_br.rename(columns={"value": "unemp_bra"}),
+        "retail_bra": df_retail_br.rename(columns={"value": "retail_bra"}),
+    }
+
+    # Individual downloads
+    st.markdown("**Per-series CSVs**")
+    for name, df in labeled.items():
+        if df is not None and not df.empty:
+            csv_bytes = df_to_csv_bytes(df[[df.columns[-1]]])  # ensure single data col
+            st.download_button(
+                label=f"⬇️ Download {name}.csv",
+                data=csv_bytes,
+                file_name=f"{name}.csv",
+                mime="text/csv",
+                key=f"dl_{name}"
+            )
+
+    # Combined download (outer join on date)
+    st.markdown("---")
+    st.markdown("**Combined CSV (all series, aligned by date)**")
+    all_df = None
+    for df in labeled.values():
+        if df is None or df.empty:
+            continue
+        col = df.columns[-1]
+        one = df[[col]]
+        all_df = one if all_df is None else all_df.join(one, how="outer")
+    if all_df is None or all_df.empty:
+        st.info("No data available to combine.")
+    else:
+        all_df = all_df.sort_index()
+        st.dataframe(all_df.tail(15), use_container_width=True, height=300)
+        st.download_button(
+            label="⬇️ Download combined.csv",
+            data=df_to_csv_bytes(all_df),
+            file_name="combined.csv",
+            mime="text/csv",
+            key="dl_combined"
+        )
+
+# -----------------------------
+# Footer / Hints
+# -----------------------------
+st.markdown("---")
+with st.expander("ℹ️ Sources & tips"):
+    st.markdown(
+        """
+- **USA (FRED)** via `pandas_datareader`: FEDFUNDS, CPIAUCSL, GDP, UNRATE, RSAFS.
+- **Brazil (BCB SGS)** for Selic & IPCA; **World Bank** for GDP & Unemployment; **SGS** for retail index.
+- If a Brazilian series looks off, swap the SGS IDs in the sidebar (there are variants).
+- The app caches results. Change a series ID or date to refresh that fetch.
+"""
+    )
