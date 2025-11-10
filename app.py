@@ -403,7 +403,7 @@ with tabs[0]:
 
             "Selic (meta, % a.a.)": df_selic,
             "IPCA 12m (%)": df_ipca_12m,
-            "PIB Brasil (R$ milhões)": (scale_df(df_gdp_br, 1e6) if not df_gdp_br.empty else df_gdp_br),
+            "PIB Brasil (R$ trilhões)": (scale_df(df_gdp_br, 1e12) if not df_gdp_br.empty else df_gdp_br),
             "Desemprego (%, IBGE)": df_unemp_br,
             "Varejo – índice (PMC)": df_retail_br,
         }
