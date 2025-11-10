@@ -336,7 +336,7 @@ st.markdown(
         <img src="{logo_path}" width="60" style="border-radius:8px;">
         <h1 style="margin-bottom:0;">Macro Dashboard — USA & Brazil</h1>
     </div>
-    <p style="margin-top:-10px;color:gray;">Bloomberg-style dark theme • CSV downloads • Mobile-friendly</p>
+    <p style="margin-top:-10px;color:gray;">Resumo macroeconômico</p>
     """,
     unsafe_allow_html=True
 )
