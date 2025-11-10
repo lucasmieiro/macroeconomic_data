@@ -4,13 +4,13 @@
 
 from typing import Optional
 from datetime import date, datetime
+import time
 import io
 import pandas as pd
 import numpy as np
 import requests
 import streamlit as st
 import plotly.express as px
-import time
 # -----------------------------
 # Page / Theme
 # -----------------------------
@@ -115,15 +115,21 @@ def fetch_fred(series_id: str, start: Optional[str], end: Optional[str]) -> pd.D
     except Exception as e:
         st.warning(f"FRED fetch failed for `{series_id}`: {e}")
         return pd.DataFrame(columns=["value", "series"])
-
 @st.cache_data(show_spinner=False)
-def fetch_bcb_sgs(series_id: int, start: Optional[str], end: Optional[str],
-                  tries: int = 3, timeout: int = 60) -> pd.DataFrame:
+def fetch_bcb_sgs(
+    series_id: int,
+    start: Optional[str],
+    end: Optional[str],
+    tries: int = 3,
+    timeout: int = 60
+) -> pd.DataFrame:
     """
-    Fetch a Banco Central do Brasil SGS series with retries, longer timeout, and
-    a 10-year clamp for daily series (as required by SGS).
+    Robust Banco Central do Brasil SGS fetch:
+    - Clamps window to 10 years (daily-series rule).
+    - Retries with exponential backoff.
+    - Falls back to CSV if JSON is unavailable / broken.
     """
-    # compute start/end and clamp to 10 years (daily-series rule)
+    # 10y clamp for daily series (SGS policy)
     end_dt = pd.to_datetime(end) if end else pd.Timestamp.today()
     start_dt = pd.to_datetime(start) if start else end_dt - pd.Timedelta(days=3650)
     if (end_dt - start_dt).days > 3650:
@@ -133,43 +139,85 @@ def fetch_bcb_sgs(series_id: int, start: Optional[str], end: Optional[str],
 
     start_d = start_dt.strftime("%d/%m/%Y")
     end_d   = end_dt.strftime("%d/%m/%Y")
-    url = (
-        f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{series_id}/dados"
-        f"?formato=json&dataInicial={start_d}&dataFinal={end_d}"
-    )
+
+    base = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{series_id}/dados"
+    url_json = f"{base}?formato=json&dataInicial={start_d}&dataFinal={end_d}"
+    url_csv  = f"{base}?formato=csv&dataInicial={start_d}&dataFinal={end_d}"
 
     last_err = None
     for i in range(tries):
         try:
-            resp = requests.get(
-                url,
+            # --- 1) Try JSON ---
+            r = requests.get(
+                url_json,
                 headers={
                     "Accept": "application/json; charset=utf-8",
                     "User-Agent": UA_HEADERS["User-Agent"],
                 },
                 timeout=timeout,
             )
-            resp.raise_for_status()
-            data = resp.json()
-            df = pd.DataFrame(data)
-            if df.empty or "data" not in df or "valor" not in df:
-                return pd.DataFrame(columns=["value", "series"])
-            df["date"] = pd.to_datetime(df["data"], format="%d/%m/%Y", errors="coerce")
-            df["value"] = pd.to_numeric(df["valor"].str.replace(",", "."), errors="coerce")
-            df = df[["date", "value"]].dropna().set_index("date").sort_index()
-            df["series"] = str(series_id)
-            return df
-        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
+            r.raise_for_status()
+
+            # Some gateways return empty body or HTML even with 200 OK.
+            if "application/json" in (r.headers.get("Content-Type", "")).lower():
+                data = r.json()
+            else:
+                data = None
+
+            if data:
+                df = pd.DataFrame(data)
+                if not df.empty and {"data","valor"}.issubset(df.columns):
+                    df["date"]  = pd.to_datetime(df["data"],  format="%d/%m/%Y", errors="coerce")
+                    df["value"] = pd.to_numeric(df["valor"].str.replace(",", "."), errors="coerce")
+                    out = df[["date","value"]].dropna().set_index("date").sort_index()
+                    out["series"] = str(series_id)
+                    return out
+
+            # --- 2) Fallback to CSV ---
+            rc = requests.get(
+                url_csv,
+                headers={
+                    "Accept": "text/csv, */*;q=0.1",
+                    "User-Agent": UA_HEADERS["User-Agent"],
+                },
+                timeout=timeout,
+            )
+            rc.raise_for_status()
+            txt = rc.text.strip()
+
+            # Quick guard: empty or HTML page?
+            if not txt or txt.lower().startswith("<!doctype html"):
+                raise ValueError("SGS returned empty/HTML for CSV")
+
+            dfc = pd.read_csv(io.StringIO(txt), sep=";")
+            # Expected columns: data;valor
+            if not {"data","valor"}.issubset(dfc.columns):
+                # Try fallback separators just in case
+                try:
+                    dfc = pd.read_csv(io.StringIO(txt))
+                except Exception:
+                    raise ValueError(f"Unexpected CSV columns: {list(dfc.columns)}")
+
+            dfc["date"]  = pd.to_datetime(dfc["data"],  format="%d/%m/%Y", errors="coerce")
+            # decimal comma → dot
+            dfc["value"] = pd.to_numeric(
+                dfc["valor"].astype(str).str.replace(",", "."),
+                errors="coerce"
+            )
+            out = dfc[["date","value"]].dropna().set_index("date").sort_index()
+            out["series"] = str(series_id)
+            return out
+
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError, ValueError) as e:
             last_err = e
             # exponential backoff: 1.5s, 3s, 6s...
             time.sleep(1.5 * (2 ** i))
         except Exception as e:
             st.warning(f"BCB SGS fetch failed for `{series_id}`: {e}")
-            return pd.DataFrame(columns=["value", "series"])
+            return pd.DataFrame(columns=["value","series"])
 
     st.warning(f"BCB SGS fetch failed for `{series_id}` after {tries} attempts: {last_err}")
-    return pd.DataFrame(columns=["value", "series"])
-
+    return pd.DataFrame(columns=["value","series"])
 
 @st.cache_data(show_spinner=False)
 def fetch_worldbank(indicator: str, country_code: str = "USA", start_year: int = 1990, end_year: Optional[int] = None) -> pd.DataFrame:
@@ -323,35 +371,36 @@ with tabs[0]:
         last_date = df.index.max()
         return float(df.loc[last_date, "value"]), last_date.strftime("%Y-%m-%d")
 
-    # NOTE: This dict lives under the 'with tabs[0]:' indentation (8 spaces)
+    try:
         metrics = {
-        "Fed Funds (USA, %)": df_fedfunds,
-        "CPI (USA, index)": df_cpi_us,
-        "GDP (USA, $tn)": scale_df(df_gdp_us, 1e3) if not df_gdp_us.empty else df_gdp_us,
-        "Unemp (USA, %)": df_unrate_us,
-        "Retail (USA, $m)": df_retail_us,
+            "Fed Funds (USA, %)": df_fedfunds,
+            "CPI (USA, index)": df_cpi_us,
+            "GDP (USA, $tn)": scale_df(df_gdp_us, 1e3) if not df_gdp_us.empty else df_gdp_us,
+            "Unemp (USA, %)": df_unrate_us,
+            "Retail (USA, $m)": df_retail_us,
 
-        # Brazil – friendlier labels
-        "Selic (meta, % a.a.)": df_selic,
-        "IPCA mensal (% m/m)": df_ipca,
-        "PIB Brasil (R$ correntes)": df_gdp_br,
-        "Desemprego (%, IBGE)": df_unemp_br,
-        "Varejo – índice (PMC)": df_retail_br,
-    }
+            "Selic (meta, % a.a.)": df_selic,
+            "IPCA mensal (% m/m)": df_ipca,
+            "PIB Brasil (R$ correntes)": df_gdp_br,
+            "Desemprego (%, IBGE)": df_unemp_br,
+            "Varejo – índice (PMC)": df_retail_br,
+        }
+    except Exception as e:
+        st.warning(f"Overview metrics skipped due to error: {e}")
+        metrics = {}
 
-
-    # display metrics in 2 rows
-    items = list(metrics.items())
-    half = int(np.ceil(len(items) / 2))
-    for row in [items[:half], items[half:]]:
-        cols = st.columns(len(row))
-        for (label, df_), c in zip(row, cols):
-            with c:
-                val, when = latest_value(df_)
-                if np.isnan(val):
-                    st.metric(label, "—", help="No data")
-                else:
-                    st.metric(label, f"{val:,.2f}", help=f"Last: {when}")
+    if metrics:
+        items = list(metrics.items())
+        half = int(np.ceil(len(items) / 2))
+        for row in [items[:half], items[half:]]:
+            cols = st.columns(len(row))
+            for (label, df_), c in zip(row, cols):
+                with c:
+                    val, when = latest_value(df_)
+                    if np.isnan(val):
+                        st.metric(label, "—", help="No data")
+                    else:
+                        st.metric(label, f"{val:,.2f}", help=f"Last: {when}")
 
 # -----------------------------
 # USA Tab
