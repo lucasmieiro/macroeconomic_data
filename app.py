@@ -556,37 +556,58 @@ for name, df in labeled.items():
         )
 
 # Combined download – safe concat using the numeric column for each series
+# Combined download – monthly, last 12 months (aligned by month-end)
 st.markdown("---")
-st.markdown("**Combined CSV (all series, aligned by date)**")
+st.markdown("**Combined CSV (last 12 months, month-end)**")
 
-series_list = []
+def _pick_numeric_col(df: pd.DataFrame, preferred: str) -> str | None:
+    if preferred in df.columns:
+        return preferred
+    if "value" in df.columns:
+        return "value"
+    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    return num_cols[0] if num_cols else None
+
+def _monthly_last12(df: pd.DataFrame, preferred_col: str) -> pd.Series:
+    """
+    Resample to month-end, take last observation in month, forward-fill,
+    then keep the last 12 months.
+    """
+    if df is None or df.empty:
+        return pd.Series(dtype="float64")
+
+    # choose numeric column
+    col = _pick_numeric_col(df, preferred_col)
+    if col is None:
+        return pd.Series(dtype="float64")
+
+    s = pd.to_numeric(df[col], errors="coerce")
+    s.index = pd.to_datetime(df.index)
+
+    # month-end, last obs; then ffill so annual/quarterly series fill monthly
+    sm = s.resample("M").last().ffill()
+
+    # keep last 12 non-na rows
+    sm = sm.dropna()
+    if sm.empty:
+        return sm
+    if len(sm) > 12:
+        sm = sm.iloc[-12:]
+    return sm.rename(preferred_col)
+
+series_map = {}
 for name, df in labeled.items():
     if df is not None and not df.empty:
-        df_num = df.copy()
+        s = _monthly_last12(df, name)
+        if s is not None and not s.empty:
+            series_map[name] = s
 
-        # Decide which column to use:
-        if name in df_num.columns:
-            col = name
-        elif "value" in df_num.columns:
-            col = "value"
-        else:
-            # fallback: first numeric column
-            num_cols = [c for c in df_num.columns if pd.api.types.is_numeric_dtype(df_num[c])]
-            col = num_cols[0] if num_cols else None
-
-        if col is None:
-            continue
-
-        # Ensure numeric + proper index
-        s = pd.to_numeric(df_num[col], errors="coerce").rename(name)
-        s.index = pd.to_datetime(df_num.index)
-        series_list.append(s)
-
-if not series_list:
+if not series_map:
     st.info("No data available to combine.")
 else:
-    all_df = pd.concat(series_list, axis=1).sort_index()
-    st.dataframe(all_df.tail(15), use_container_width=True, height=300)
+    all_df = pd.DataFrame(series_map).sort_index()
+    all_df.index.name = "date"
+    st.dataframe(all_df, use_container_width=True, height=300)
     st.download_button(
         label="⬇️ Download combined.csv",
         data=df_to_csv_bytes(all_df),
