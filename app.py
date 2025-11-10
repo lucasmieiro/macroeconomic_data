@@ -1,16 +1,22 @@
+# Write a full patched app.py with all requested features and improvements.
+from datetime import date
+import os, textwrap, zipfile, pathlib
+
 # app.py
 # Streamlit macro dashboard (USA + Brazil) with Bloomberg-like look, CSV download
 # Run locally: streamlit run app.py
 
 from typing import Optional
 from datetime import date, datetime
-import time
 import io
-import pandas as pd
+import time
+
 import numpy as np
+import pandas as pd
 import requests
-import streamlit as st
 import plotly.express as px
+import streamlit as st
+
 # -----------------------------
 # Page / Theme
 # -----------------------------
@@ -115,6 +121,7 @@ def fetch_fred(series_id: str, start: Optional[str], end: Optional[str]) -> pd.D
     except Exception as e:
         st.warning(f"FRED fetch failed for `{series_id}`: {e}")
         return pd.DataFrame(columns=["value", "series"])
+
 @st.cache_data(show_spinner=False)
 def fetch_bcb_sgs(
     series_id: int,
@@ -168,7 +175,7 @@ def fetch_bcb_sgs(
                 df = pd.DataFrame(data)
                 if not df.empty and {"data","valor"}.issubset(df.columns):
                     df["date"]  = pd.to_datetime(df["data"],  format="%d/%m/%Y", errors="coerce")
-                    df["value"] = pd.to_numeric(df["valor"].str.replace(",", "."), errors="coerce")
+                    df["value"] = pd.to_numeric(df["valor"].astype(str).str.replace(",", "."), errors="coerce")
                     out = df[["date","value"]].dropna().set_index("date").sort_index()
                     out["series"] = str(series_id)
                     return out
@@ -189,21 +196,14 @@ def fetch_bcb_sgs(
             if not txt or txt.lower().startswith("<!doctype html"):
                 raise ValueError("SGS returned empty/HTML for CSV")
 
+            # default SGS CSV uses ';' and decimal comma
             dfc = pd.read_csv(io.StringIO(txt), sep=";")
-            # Expected columns: data;valor
             if not {"data","valor"}.issubset(dfc.columns):
-                # Try fallback separators just in case
-                try:
-                    dfc = pd.read_csv(io.StringIO(txt))
-                except Exception:
-                    raise ValueError(f"Unexpected CSV columns: {list(dfc.columns)}")
+                # Try generic CSV parser as a fallback
+                dfc = pd.read_csv(io.StringIO(txt))
 
             dfc["date"]  = pd.to_datetime(dfc["data"],  format="%d/%m/%Y", errors="coerce")
-            # decimal comma → dot
-            dfc["value"] = pd.to_numeric(
-                dfc["valor"].astype(str).str.replace(",", "."),
-                errors="coerce"
-            )
+            dfc["value"] = pd.to_numeric(dfc["valor"].astype(str).str.replace(",", "."), errors="coerce")
             out = dfc[["date","value"]].dropna().set_index("date").sort_index()
             out["series"] = str(series_id)
             return out
@@ -283,6 +283,55 @@ def scale_df(df: pd.DataFrame, factor: float) -> pd.DataFrame:
         out["value"] = pd.to_numeric(out["value"], errors="coerce") / factor
     return out
 
+# ---- NEW HELPERS ----
+def yoy_rate_from_index(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    12-month % change from a price index level (e.g., CPIAUCSL).
+    value% = 100 * (P_t / P_{t-12} - 1)
+    """
+    if df is None or df.empty or "value" not in df.columns:
+        return pd.DataFrame(columns=["value", "series"])
+    out = df[["value"]].copy()
+    out["value"] = (out["value"] / out["value"].shift(12) - 1.0) * 100.0
+    out = out.dropna().copy()
+    out["series"] = df["series"].iloc[0] if "series" in df.columns and not df.empty else "yoy"
+    return out
+
+def ipca_12m_from_mom(df_mom_pct: pd.DataFrame) -> pd.DataFrame:
+    """
+    12-month accumulated IPCA from monthly % changes.
+    Compounds the last 12 (1 + m/100) and subtracts 1, then *100.
+    """
+    if df_mom_pct is None or df_mom_pct.empty or "value" not in df_mom_pct.columns:
+        return pd.DataFrame(columns=["value", "series"])
+    m = pd.to_numeric(df_mom_pct["value"], errors="coerce") / 100.0
+    out = pd.DataFrame(index=df_mom_pct.index.copy())
+    out["value"] = (1.0 + m).rolling(12).apply(lambda x: float(np.prod(x)) - 1.0, raw=True) * 100.0
+    out = out.dropna().copy()
+    out["series"] = "IPCA_12m"
+    return out
+
+def combo_two_series(df1: pd.DataFrame, label1: str, df2: pd.DataFrame, label2: str, title: str):
+    """
+    Build a Plotly figure overlaying two % series on the same axis.
+    """
+    if df1 is None or df1.empty or df2 is None or df2.empty:
+        return None
+    a = df1[["value"]].rename(columns={"value": label1})
+    b = df2[["value"]].rename(columns={"value": label2})
+    combo = a.join(b, how="inner").dropna().reset_index().rename(columns={"index": "date"})
+    long = combo.melt(id_vars="date", var_name="series", value_name="value")
+    fig = px.line(long, x="date", y="value", color="series", title=title, template="plotly_dark")
+    fig.update_layout(
+        height=420, margin=dict(l=10, r=10, t=60, b=10),
+        xaxis_title=None, yaxis_title="%",
+        font=dict(family="ui-monospace", size=13),
+        hovermode="x unified",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    fig.update_traces(line=dict(width=2))
+    return fig
+
 # -----------------------------
 # Sidebar Controls
 # -----------------------------
@@ -348,6 +397,13 @@ with st.spinner("Fetching data..."):
     df_gdp_br = fetch_worldbank(wb_gdp_bra, "BRA", start_year=pd.to_datetime(start_str).year, end_year=pd.to_datetime(end_str).year)
     df_unemp_br = fetch_worldbank(wb_unemp_bra, "BRA", start_year=pd.to_datetime(start_str).year, end_year=pd.to_datetime(end_str).year)
 
+# ---- DERIVED SERIES (12-month rates) ----
+# US CPI YoY from CPI index:
+df_cpi_us_yoy = yoy_rate_from_index(df_cpi_us)
+
+# Brazil IPCA 12m from IPCA m/m %:
+df_ipca_12m = ipca_12m_from_mom(df_ipca)
+
 # -----------------------------
 # Layout
 # -----------------------------
@@ -374,13 +430,13 @@ with tabs[0]:
     try:
         metrics = {
             "Fed Funds (USA, %)": df_fedfunds,
-            "CPI (USA, index)": df_cpi_us,
+            "CPI (USA, 12m %)": df_cpi_us_yoy,
             "GDP (USA, $tn)": scale_df(df_gdp_us, 1e3) if not df_gdp_us.empty else df_gdp_us,
             "Unemp (USA, %)": df_unrate_us,
             "Retail (USA, $m)": df_retail_us,
 
             "Selic (meta, % a.a.)": df_selic,
-            "IPCA mensal (% m/m)": df_ipca,
+            "IPCA 12m (%)": df_ipca_12m,
             "PIB Brasil (R$ correntes)": df_gdp_br,
             "Desemprego (%, IBGE)": df_unemp_br,
             "Varejo – índice (PMC)": df_retail_br,
@@ -409,8 +465,14 @@ with tabs[1]:
     st.subheader("United States")
     if not df_fedfunds.empty:
         st.plotly_chart(px_line_common(df_fedfunds, "Fed Funds Rate (Effective)", "%"), use_container_width=True)
-    if not df_cpi_us.empty:
-        st.plotly_chart(px_line_common(df_cpi_us, "CPI (1982–84=100)", "Index"), use_container_width=True)
+    if not df_cpi_us_yoy.empty:
+        st.plotly_chart(px_line_common(df_cpi_us_yoy, "CPI – 12-month % change", "%"), use_container_width=True)
+
+    # New: comparison chart (rates vs inflation)
+    fig_us_combo = combo_two_series(df_fedfunds, "Fed Funds (%)", df_cpi_us_yoy, "CPI YoY (%)", "US – Rates vs Inflation (YoY %)")
+    if fig_us_combo:
+        st.plotly_chart(fig_us_combo, use_container_width=True)
+
     if not df_gdp_us.empty:
         st.plotly_chart(px_line_common(df_gdp_us, "GDP (Nominal)", "USD (Billions)"), use_container_width=True)
     if not df_unrate_us.empty:
@@ -423,11 +485,22 @@ with tabs[1]:
 # -----------------------------
 with tabs[2]:
     st.subheader("Brasil")
+
+    # New: IPCA 12m first (most used for analysis with Selic)
+    if not df_ipca_12m.empty:
+        st.plotly_chart(px_line_common(df_ipca_12m, "IPCA – 12 meses (%)", "% a.a."), use_container_width=True)
+
     if not df_selic.empty:
         st.plotly_chart(px_line_common(df_selic, "Selic – taxa meta (% a.a.)", "% a.a."), use_container_width=True)
     else:
         st.info("Selic: ajuste o ID da série SGS na barra lateral (ex.: 432 = meta diária).")
 
+    # New: comparison chart (taxa x inflação)
+    fig_br_combo = combo_two_series(df_selic, "Selic (%)", df_ipca_12m, "IPCA 12m (%)", "Brasil – Selic vs IPCA 12m (YoY %)")
+    if fig_br_combo:
+        st.plotly_chart(fig_br_combo, use_container_width=True)
+
+    # Keep m/m IPCA series if useful
     if not df_ipca.empty:
         st.plotly_chart(px_line_common(df_ipca, "IPCA – variação mensal (%)", "% m/m"), use_container_width=True)
     else:
@@ -435,18 +508,10 @@ with tabs[2]:
 
     if not df_gdp_br.empty:
         st.plotly_chart(px_line_common(df_gdp_br, "PIB (preços correntes, anual)", "R$ correntes"), use_container_width=True)
-    else:
-        st.info("PIB (Brasil): verifique o indicador do World Bank (padrão: NY.GDP.MKTP.CN).")
-
     if not df_unemp_br.empty:
         st.plotly_chart(px_line_common(df_unemp_br, "Desemprego – taxa anual (%)", "% da força de trabalho"), use_container_width=True)
-    else:
-        st.info("Desemprego (Brasil): indicador padrão WB: SL.UEM.TOTL.ZS.")
-
     if not df_retail_br.empty:
         st.plotly_chart(px_line_common(df_retail_br, "Varejo (PMC) – índice", "Índice"), use_container_width=True)
-    else:
-        st.info("Varejo (PMC): ajuste o ID da série SGS (ex.: 1552).")
 
 # -----------------------------
 # Downloads Tab
@@ -457,13 +522,14 @@ with tabs[3]:
 
     labeled = {
         "fedfunds_usa": df_fedfunds.rename(columns={"value": "fedfunds_usa"}),
-        "cpi_usa": df_cpi_us.rename(columns={"value": "cpi_usa"}),
+        "cpi_usa_yoy": df_cpi_us_yoy.rename(columns={"value": "cpi_usa_yoy"}),  # include derived series
         "gdp_usa": df_gdp_us.rename(columns={"value": "gdp_usa"}),
         "unemp_usa": df_unrate_us.rename(columns={"value": "unemp_usa"}),
         "retail_usa": df_retail_us.rename(columns={"value": "retail_usa"}),
 
         "selic_bra": df_selic.rename(columns={"value": "selic_bra"}),
-        "ipca_bra": df_ipca.rename(columns={"value": "ipca_bra"}),
+        "ipca_bra_mom": df_ipca.rename(columns={"value": "ipca_bra_mom"}),
+        "ipca_bra_12m": df_ipca_12m.rename(columns={"value": "ipca_bra_12m"}),  # include derived series
         "gdp_bra": df_gdp_br.rename(columns={"value": "gdp_bra"}),
         "unemp_bra": df_unemp_br.rename(columns={"value": "unemp_bra"}),
         "retail_bra": df_retail_br.rename(columns={"value": "retail_bra"}),
@@ -512,7 +578,15 @@ with st.expander("ℹ️ Sources & tips"):
         """
 - **USA (FRED)** via official API (if key provided) or public **fredgraph.csv** fallback.
 - **Brazil (BCB SGS)** for Selic & IPCA (10-year window clamp for daily series); **World Bank** for GDP & Unemployment; **SGS** for retail index.
+- CPI and IPCA here include **12-month rates** for better comparison with policy rates.
 - Use the Start/End date pickers (End defaults to **today**) to filter the charts and CSVs.
 - The app caches results. Change a series ID or date to refresh that fetch.
 """
     )
+
+
+out_path = "/mnt/data/app.py"
+with open(out_path, "w", encoding="utf-8") as f:
+    f.write(app_code)
+
+out_path
