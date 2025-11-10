@@ -3,7 +3,8 @@
 # Run locally: streamlit run app.py
 
 from typing import Optional
-from datetime import date
+from datetime import date, datetime
+import io
 import pandas as pd
 import numpy as np
 import requests
@@ -41,19 +42,29 @@ st.markdown(
 # Helpers
 # -----------------------------
 
+UA_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (StreamlitApp; +https://streamlit.io)",
+    "Accept": "text/csv,application/json;q=0.9,*/*;q=0.8",
+}
+
 @st.cache_data(show_spinner=False)
-def fetch_fred(series_id: str, start: Optional[str]) -> pd.DataFrame:
+def fetch_fred(series_id: str, start: Optional[str], end: Optional[str]) -> pd.DataFrame:
     """
-    Fetch a FRED series via the public fredgraph.csv endpoint (no API key).
+    Fetch a FRED series via fredgraph.csv with explicit headers.
     Example: https://fred.stlouisfed.org/graph/fredgraph.csv?id=UNRATE
     """
-    import urllib.parse
-    base = "https://fred.stlouisfed.org/graph/fredgraph.csv"
-    url = f"{base}?id={urllib.parse.quote(series_id)}"
     try:
-        df = pd.read_csv(url)
-        # Expect columns: DATE, <SERIESID>
-        value_cols = [c for c in df.columns if c.upper() != "DATE"]
+        url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
+        resp = requests.get(url, headers=UA_HEADERS, timeout=30)
+        resp.raise_for_status()
+        text = resp.text
+        # Sometimes a blocking page (HTML) is returned; detect it
+        if "<!DOCTYPE html" in text.lower():
+            raise ValueError("FRED returned HTML instead of CSV (blocked).")
+        df = pd.read_csv(io.StringIO(text))
+        if "DATE" not in df.columns:
+            raise ValueError(f"Unexpected CSV columns: {df.columns.tolist()}")
+        value_cols = [c for c in df.columns if c != "DATE"]
         if not value_cols:
             return pd.DataFrame(columns=["value", "series"])
         value_col = value_cols[0]
@@ -62,6 +73,8 @@ def fetch_fred(series_id: str, start: Optional[str]) -> pd.DataFrame:
         df = df[["date", "value"]].dropna()
         if start:
             df = df[df["date"] >= pd.to_datetime(start)]
+        if end:
+            df = df[df["date"] <= pd.to_datetime(end)]
         df = df.set_index("date")
         df["series"] = series_id
         return df
@@ -70,27 +83,28 @@ def fetch_fred(series_id: str, start: Optional[str]) -> pd.DataFrame:
         return pd.DataFrame(columns=["value", "series"])
 
 @st.cache_data(show_spinner=False)
-def fetch_bcb_sgs(series_id: int, start: Optional[str]) -> pd.DataFrame:
+def fetch_bcb_sgs(series_id: int, start: Optional[str], end: Optional[str]) -> pd.DataFrame:
     """
     Fetch a Banco Central do Brasil SGS series.
     Endpoint: https://api.bcb.gov.br/dados/serie/bcdata.sgs.{series_id}/dados?formato=json
-    Optional start parameter handled by filtering after fetch.
+    Some environments require explicit Accept headers; we also allow start/end filtering client-side.
     """
     url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{series_id}/dados?formato=json"
     try:
-        r = requests.get(url, timeout=20)
-        r.raise_for_status()
-        data = r.json()
+        resp = requests.get(url, headers={"Accept": "application/json", "User-Agent": UA_HEADERS["User-Agent"]}, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
         df = pd.DataFrame(data)
         if df.empty:
             return pd.DataFrame(columns=["value", "series"])
-        # SGS returns 'data' (dd/mm/YYYY) and 'valor' strings
         df["date"] = pd.to_datetime(df["data"], format="%d/%m/%Y", errors="coerce")
         df["value"] = pd.to_numeric(df["valor"].str.replace(",", "."), errors="coerce")
         df = df[["date", "value"]].dropna()
         if start:
             df = df[df["date"] >= pd.to_datetime(start)]
-        df = df.set_index("date")
+        if end:
+            df = df[df["date"] <= pd.to_datetime(end)]
+        df = df.set_index("date").sort_index()
         df["series"] = str(series_id)
         return df
     except Exception as e:
@@ -98,13 +112,13 @@ def fetch_bcb_sgs(series_id: int, start: Optional[str]) -> pd.DataFrame:
         return pd.DataFrame(columns=["value", "series"])
 
 @st.cache_data(show_spinner=False)
-def fetch_worldbank(indicator: str, country_code: str = "USA", start_year: int = 1990) -> pd.DataFrame:
+def fetch_worldbank(indicator: str, country_code: str = "USA", start_year: int = 1990, end_year: Optional[int] = None) -> pd.DataFrame:
     """
     Fetch World Bank series: indicator (e.g., 'NY.GDP.MKTP.CN', 'SL.UEM.TOTL.ZS'), country code (e.g., 'USA','BRA').
     """
     try:
         url = f"https://api.worldbank.org/v2/country/{country_code}/indicator/{indicator}?format=json&per_page=20000"
-        r = requests.get(url, timeout=25)
+        r = requests.get(url, headers={"Accept": "application/json", "User-Agent": UA_HEADERS["User-Agent"]}, timeout=30)
         r.raise_for_status()
         payload = r.json()
         if not isinstance(payload, list) or len(payload) < 2:
@@ -114,13 +128,17 @@ def fetch_worldbank(indicator: str, country_code: str = "USA", start_year: int =
         if df.empty or "date" not in df or "value" not in df:
             return pd.DataFrame(columns=["value", "series"])
         df = df[["date", "value"]].dropna()
+        df["year"] = pd.to_numeric(df["date"], errors="coerce")
+        df = df.dropna(subset=["year"])
+        if end_year is None:
+            end_year = datetime.today().year
+        df = df[(df["year"] >= start_year) & (df["year"] <= end_year)]
         # annual -> end-of-year timestamp
-        df["date"] = pd.to_datetime(df["date"].astype(str) + "-12-31", errors="coerce")
+        df["date"] = pd.to_datetime(df["year"].astype(int).astype(str) + "-12-31", errors="coerce")
         df["value"] = pd.to_numeric(df["value"], errors="coerce")
-        df = df.dropna().sort_values("date")
-        df = df[df["date"].dt.year >= start_year].set_index("date")
+        df = df.dropna(subset=["date", "value"]).sort_values("date").set_index("date")
         df["series"] = indicator
-        return df
+        return df[["value", "series"]]
     except Exception as e:
         st.warning(f"World Bank fetch failed for `{country_code}:{indicator}`: {e}")
         return pd.DataFrame(columns=["value", "series"])
@@ -155,7 +173,9 @@ st.sidebar.title("⚙️ Settings")
 
 st.sidebar.markdown("**Date filter**")
 default_start = st.sidebar.date_input("Start date", value=date(2010, 1, 1))
+default_end = st.sidebar.date_input("End date", value=date.today())
 start_str = default_start.isoformat()
+end_str = default_end.isoformat()
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Series (you can change these):**")
@@ -192,19 +212,19 @@ st.caption("Bloomberg-style dark theme • common chart design • CSV downloads
 # -----------------------------
 with st.spinner("Fetching data..."):
     # USA (FRED via fredgraph.csv)
-    df_fedfunds = fetch_fred(us_series["Fed Funds (USA)"], start_str)
-    df_cpi_us = fetch_fred(us_series["CPI (USA)"], start_str)
-    df_gdp_us = fetch_fred(us_series["GDP (USA, nominal)"], start_str)
-    df_unrate_us = fetch_fred(us_series["Unemployment Rate (USA)"], start_str)
-    df_retail_us = fetch_fred(us_series["Retail Sales (USA)"], start_str)
+    df_fedfunds = fetch_fred(us_series["Fed Funds (USA)"], start_str, end_str)
+    df_cpi_us = fetch_fred(us_series["CPI (USA)"], start_str, end_str)
+    df_gdp_us = fetch_fred(us_series["GDP (USA, nominal)"], start_str, end_str)
+    df_unrate_us = fetch_fred(us_series["Unemployment Rate (USA)"], start_str, end_str)
+    df_retail_us = fetch_fred(us_series["Retail Sales (USA)"], start_str, end_str)
 
     # Brazil (BCB SGS + World Bank)
-    df_selic = fetch_bcb_sgs(int(brazil_sgs_selic), start_str) if brazil_sgs_selic.isdigit() else pd.DataFrame()
-    df_ipca = fetch_bcb_sgs(int(brazil_sgs_ipca), start_str) if brazil_sgs_ipca.isdigit() else pd.DataFrame()
-    df_retail_br = fetch_bcb_sgs(int(brazil_sgs_retail), start_str) if brazil_sgs_retail.isdigit() else pd.DataFrame()
+    df_selic = fetch_bcb_sgs(int(brazil_sgs_selic), start_str, end_str) if brazil_sgs_selic.isdigit() else pd.DataFrame()
+    df_ipca = fetch_bcb_sgs(int(brazil_sgs_ipca), start_str, end_str) if brazil_sgs_ipca.isdigit() else pd.DataFrame()
+    df_retail_br = fetch_bcb_sgs(int(brazil_sgs_retail), start_str, end_str) if brazil_sgs_retail.isdigit() else pd.DataFrame()
 
-    df_gdp_br = fetch_worldbank(wb_gdp_bra, "BRA", start_year=pd.to_datetime(start_str).year)
-    df_unemp_br = fetch_worldbank(wb_unemp_bra, "BRA", start_year=pd.to_datetime(start_str).year)
+    df_gdp_br = fetch_worldbank(wb_gdp_bra, "BRA", start_year=pd.to_datetime(start_str).year, end_year=pd.to_datetime(end_str).year)
+    df_unemp_br = fetch_worldbank(wb_unemp_bra, "BRA", start_year=pd.to_datetime(start_str).year, end_year=pd.to_datetime(end_str).year)
 
 # -----------------------------
 # Layout
@@ -332,20 +352,18 @@ with tabs[3]:
                 key=f"dl_{name}"
             )
 
-    # Combined download (outer join on date)
+    # Combined download – safe concat using Series rename (no column overlap errors)
     st.markdown("---")
     st.markdown("**Combined CSV (all series, aligned by date)**")
-    all_df = None
-    for df in labeled.values():
-        if df is None or df.empty:
-            continue
-        col = df.columns[-1]
-        one = df[[col]]
-        all_df = one if all_df is None else all_df.join(one, how="outer")
-    if all_df is None or all_df.empty:
+    series_list = []
+    for name, df in labeled.items():
+        if df is not None and not df.empty:
+            s = df.iloc[:, -1].rename(name)
+            series_list.append(s)
+    if not series_list:
         st.info("No data available to combine.")
     else:
-        all_df = all_df.sort_index()
+        all_df = pd.concat(series_list, axis=1).sort_index()
         st.dataframe(all_df.tail(15), use_container_width=True, height=300)
         st.download_button(
             label="⬇️ Download combined.csv",
@@ -365,6 +383,7 @@ with st.expander("ℹ️ Sources & tips"):
 - **USA (FRED)** via public **fredgraph.csv** endpoint: no API key required (e.g., FEDFUNDS, CPIAUCSL, GDP, UNRATE, RSAFS).
 - **Brazil (BCB SGS)** for Selic & IPCA; **World Bank** for GDP & Unemployment; **SGS** for retail index.
 - If a Brazilian series looks off, swap the SGS IDs in the sidebar (there are variants).
+- Use the Start/End date pickers (now includes **today**) to filter the charts and CSVs.
 - The app caches results. Change a series ID or date to refresh that fetch.
 """
     )
