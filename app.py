@@ -201,6 +201,17 @@ def px_line_common(df: pd.DataFrame, title: str, y_label: str):
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=True).encode("utf-8")
 
+def scale_df(df: pd.DataFrame, factor: float) -> pd.DataFrame:
+    """Return a copy where only the numeric 'value' column is scaled by 1/factor.
+    Keeps the 'series' column intact.
+    """
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    if 'value' in out.columns:
+        out['value'] = pd.to_numeric(out['value'], errors='coerce') / factor
+    return out
+
 # -----------------------------
 # Sidebar Controls
 # -----------------------------
@@ -293,7 +304,7 @@ with tabs[0]:
     metrics = {
         "Fed Funds (USA, %)": df_fedfunds,
         "CPI (USA, index)": df_cpi_us,
-        "GDP (USA, $bn)": (df_gdp_us / 1e3) if not df_gdp_us.empty else df_gdp_us,  # display in $ trillions
+        "GDP (USA, $tn)": scale_df(df_gdp_us, 1e3) if not df_gdp_us.empty else df_gdp_us
         "Unemp (USA, %)": df_unrate_us,
         "Retail (USA, $m)": df_retail_us,
 
