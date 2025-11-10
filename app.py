@@ -583,10 +583,3 @@ with st.expander("ℹ️ Sources & tips"):
 - The app caches results. Change a series ID or date to refresh that fetch.
 """
     )
-
-
-out_path = "/mnt/data/app.py"
-with open(out_path, "w", encoding="utf-8") as f:
-    f.write(app_code)
-
-out_path
