@@ -555,14 +555,31 @@ for name, df in labeled.items():
             key=f"dl_{name}"
         )
 
-# Combined download – safe concat using Series rename (no column overlap errors)
+# Combined download – safe concat using the numeric column for each series
 st.markdown("---")
 st.markdown("**Combined CSV (all series, aligned by date)**")
 
 series_list = []
 for name, df in labeled.items():
     if df is not None and not df.empty:
-        s = df.iloc[:, -1].rename(name)
+        df_num = df.copy()
+
+        # Decide which column to use:
+        if name in df_num.columns:
+            col = name
+        elif "value" in df_num.columns:
+            col = "value"
+        else:
+            # fallback: first numeric column
+            num_cols = [c for c in df_num.columns if pd.api.types.is_numeric_dtype(df_num[c])]
+            col = num_cols[0] if num_cols else None
+
+        if col is None:
+            continue
+
+        # Ensure numeric + proper index
+        s = pd.to_numeric(df_num[col], errors="coerce").rename(name)
+        s.index = pd.to_datetime(df_num.index)
         series_list.append(s)
 
 if not series_list:
@@ -577,7 +594,6 @@ else:
         mime="text/csv",
         key="dl_combined"
     )
-
 
 # -----------------------------
 # Footer / Hints
