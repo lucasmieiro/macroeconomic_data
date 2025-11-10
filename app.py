@@ -535,44 +535,49 @@ with tabs[3]:
         "retail_bra": df_retail_br.rename(columns={"value": "retail_bra"}),
     }
 
-    # Individual downloads
-    st.markdown("**Per-series CSVs**")
-    for name, df in labeled.items():
-        if df is not None and not df.empty:
-            if "value" in df.columns:
-    df_out = df[["value"]].rename(columns={"value": name})
-            else:
-    df_out = df
-csv_bytes = df_to_csv_bytes(df_out)
-  # ensure single data col
-            st.download_button(
-                label=f"⬇️ Download {name}.csv",
-                data=csv_bytes,
-                file_name=f"{name}.csv",
-                mime="text/csv",
-                key=f"dl_{name}"
-            )
+   # Individual downloads
+st.markdown("**Per-series CSVs**")
 
-    # Combined download – safe concat using Series rename (no column overlap errors)
-    st.markdown("---")
-    st.markdown("**Combined CSV (all series, aligned by date)**")
-    series_list = []
-    for name, df in labeled.items():
-        if df is not None and not df.empty:
-            s = df.iloc[:, -1].rename(name)
-            series_list.append(s)
-    if not series_list:
-        st.info("No data available to combine.")
-    else:
-        all_df = pd.concat(series_list, axis=1).sort_index()
-        st.dataframe(all_df.tail(15), use_container_width=True, height=300)
+for name, df in labeled.items():
+    if df is not None and not df.empty:
+        # Prepare clean DataFrame for export
+        df_out = df.copy()
+        df_out = df_out.reset_index()  # keep date as a column
+        if "value" in df_out.columns:
+            df_out = df_out[["date", "value"]].rename(columns={"value": name})
+        csv_bytes = df_to_csv_bytes(df_out)
+
         st.download_button(
-            label="⬇️ Download combined.csv",
-            data=df_to_csv_bytes(all_df),
-            file_name="combined.csv",
+            label=f"⬇️ Download {name}.csv",
+            data=csv_bytes,
+            file_name=f"{name}.csv",
             mime="text/csv",
-            key="dl_combined"
+            key=f"dl_{name}"
         )
+
+# Combined download – safe concat using Series rename (no column overlap errors)
+st.markdown("---")
+st.markdown("**Combined CSV (all series, aligned by date)**")
+
+series_list = []
+for name, df in labeled.items():
+    if df is not None and not df.empty:
+        s = df.iloc[:, -1].rename(name)
+        series_list.append(s)
+
+if not series_list:
+    st.info("No data available to combine.")
+else:
+    all_df = pd.concat(series_list, axis=1).sort_index()
+    st.dataframe(all_df.tail(15), use_container_width=True, height=300)
+    st.download_button(
+        label="⬇️ Download combined.csv",
+        data=df_to_csv_bytes(all_df),
+        file_name="combined.csv",
+        mime="text/csv",
+        key="dl_combined"
+    )
+
 
 # -----------------------------
 # Footer / Hints
