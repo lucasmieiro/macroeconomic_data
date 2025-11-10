@@ -47,51 +47,91 @@ UA_HEADERS = {
     "Accept": "text/csv,application/json;q=0.9,*/*;q=0.8",
 }
 
+
 @st.cache_data(show_spinner=False)
 def fetch_fred(series_id: str, start: Optional[str], end: Optional[str]) -> pd.DataFrame:
     """
-    Fetch a FRED series via fredgraph.csv with explicit headers.
-    Example: https://fred.stlouisfed.org/graph/fredgraph.csv?id=UNRATE
+    Fetch US series from FRED.
+    Priority:
+      1) Official FRED API (requires free API key) if available in st.secrets["FRED_API_KEY"] or sidebar field.
+      2) fredgraph.csv fallback (no key). Handles 'DATE' or 'observation_date' column names.
     """
+    api_key = st.session_state.get("fred_api_key") or st.secrets.get("FRED_API_KEY", None)
     try:
+        if api_key:
+            # Official API
+            params = {
+                "series_id": series_id,
+                "api_key": api_key,
+                "file_type": "json",
+            }
+            if start:
+                params["observation_start"] = pd.to_datetime(start).strftime("%Y-%m-%d")
+            if end:
+                params["observation_end"] = pd.to_datetime(end).strftime("%Y-%m-%d")
+            url = "https://api.stlouisfed.org/fred/series/observations"
+            r = requests.get(url, params=params, timeout=30)
+            r.raise_for_status()
+            js = r.json()
+            rows = js.get("observations", [])
+            if not rows:
+                return pd.DataFrame(columns=["value", "series"])
+            df = pd.DataFrame(rows)
+            # columns include 'date' and 'value'
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df["value"] = pd.to_numeric(df["value"], errors="coerce")
+            df = df[["date", "value"]].dropna()
+            df = df.set_index("date").sort_index()
+            df["series"] = series_id
+            return df
+
+        # Fallback: fredgraph.csv (no key)
         url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
         resp = requests.get(url, headers=UA_HEADERS, timeout=30)
         resp.raise_for_status()
         text = resp.text
-        # Sometimes a blocking page (HTML) is returned; detect it
         if "<!DOCTYPE html" in text.lower():
             raise ValueError("FRED returned HTML instead of CSV (blocked).")
         df = pd.read_csv(io.StringIO(text))
-        if "DATE" not in df.columns:
+        # Accept several date header variants
+        date_col = None
+        for candidate in ["DATE", "date", "observation_date"]:
+            if candidate in df.columns:
+                date_col = candidate
+                break
+        if date_col is None:
             raise ValueError(f"Unexpected CSV columns: {df.columns.tolist()}")
-        value_cols = [c for c in df.columns if c != "DATE"]
+        value_cols = [c for c in df.columns if c != date_col]
         if not value_cols:
             return pd.DataFrame(columns=["value", "series"])
         value_col = value_cols[0]
-        df["date"] = pd.to_datetime(df["DATE"], errors="coerce")
+        df["date"] = pd.to_datetime(df[date_col], errors="coerce")
         df["value"] = pd.to_numeric(df[value_col], errors="coerce")
         df = df[["date", "value"]].dropna()
         if start:
             df = df[df["date"] >= pd.to_datetime(start)]
         if end:
             df = df[df["date"] <= pd.to_datetime(end)]
-        df = df.set_index("date")
+        df = df.set_index("date").sort_index()
         df["series"] = series_id
         return df
     except Exception as e:
         st.warning(f"FRED fetch failed for `{series_id}`: {e}")
         return pd.DataFrame(columns=["value", "series"])
 
+
 @st.cache_data(show_spinner=False)
 def fetch_bcb_sgs(series_id: int, start: Optional[str], end: Optional[str]) -> pd.DataFrame:
     """
     Fetch a Banco Central do Brasil SGS series.
-    Endpoint: https://api.bcb.gov.br/dados/serie/bcdata.sgs.{series_id}/dados?formato=json
-    Some environments require explicit Accept headers; we also allow start/end filtering client-side.
+    The API supports optional date filters in the URL. We pass a very wide range by default to avoid 406 issues.
     """
-    url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{series_id}/dados?formato=json"
+    # Build URL with explicit date range (DD/MM/YYYY)
+    start_d = pd.to_datetime(start).strftime("%d/%m/%Y") if start else "01/01/1900"
+    end_d   = pd.to_datetime(end).strftime("%d/%m/%Y") if end else pd.Timestamp.today().strftime("%d/%m/%Y")
+    url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{series_id}/dados?formato=json&dataInicial={start_d}&dataFinal={end_d}"
     try:
-        resp = requests.get(url, headers={"Accept": "application/json", "User-Agent": UA_HEADERS["User-Agent"]}, timeout=30)
+        resp = requests.get(url, headers={"Accept": "application/json; charset=utf-8", "User-Agent": UA_HEADERS["User-Agent"]}, timeout=30)
         resp.raise_for_status()
         data = resp.json()
         df = pd.DataFrame(data)
@@ -99,12 +139,7 @@ def fetch_bcb_sgs(series_id: int, start: Optional[str], end: Optional[str]) -> p
             return pd.DataFrame(columns=["value", "series"])
         df["date"] = pd.to_datetime(df["data"], format="%d/%m/%Y", errors="coerce")
         df["value"] = pd.to_numeric(df["valor"].str.replace(",", "."), errors="coerce")
-        df = df[["date", "value"]].dropna()
-        if start:
-            df = df[df["date"] >= pd.to_datetime(start)]
-        if end:
-            df = df[df["date"] <= pd.to_datetime(end)]
-        df = df.set_index("date").sort_index()
+        df = df[["date", "value"]].dropna().set_index("date").sort_index()
         df["series"] = str(series_id)
         return df
     except Exception as e:
@@ -177,6 +212,12 @@ default_end = st.sidebar.date_input("End date", value=date.today())
 start_str = default_start.isoformat()
 end_str = default_end.isoformat()
 
+
+st.sidebar.markdown("**Optional: FRED API key**")
+fred_key = st.sidebar.text_input("Enter FRED API key (free)", value="", type="password")
+if fred_key:
+    st.session_state["fred_api_key"] = fred_key
+st.sidebar.markdown("---")
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Series (you can change these):**")
 
