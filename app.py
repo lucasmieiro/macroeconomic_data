@@ -329,17 +329,24 @@ end_str = end_date.isoformat()
 # -----------------------------
 # Header with Liga logo
 # -----------------------------
-logo_path = "assets/logo_liga_branco.png"
-st.markdown(
-    f"""
-    <div style="display:flex;align-items:center;gap:12px;">
-        <img src="{logo_path}" width="60" style="border-radius:8px;">
-        <h1 style="margin-bottom:0;">Macro Dashboard — USA & Brazil</h1>
-    </div>
-    <p style="margin-top:-10px;color:gray;">Resumo macroeconômico</p>
-    """,
-    unsafe_allow_html=True
-)
+from pathlib import Path
+
+# -----------------------------
+# Header with Liga logo (robust)
+# -----------------------------
+logo_path = Path(__file__).parent / "assets" / "logo_liga_branco.png"
+
+left, right = st.columns([1, 10], vertical_alignment="center")
+with left:
+    if logo_path.exists():
+        st.image(str(logo_path), width=60)
+    else:
+        st.write("")  # fallback spacing
+
+with right:
+    st.title("Macro Dashboard — USA & Brazil")
+    st.caption("Resumo Macroeconômico")
+
 
 # -----------------------------
 # Load Data
