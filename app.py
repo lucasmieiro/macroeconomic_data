@@ -344,8 +344,8 @@ with left:
         st.write("")  # fallback spacing
 
 with right:
-    st.title("Macro Dashboard — USA & Brazil")
-    st.caption("Resumo Macroeconômico")
+    st.title("Dashboard Macroeconômico")
+    st.caption("Principais indicadores e fontes de informação")
 
 
 # -----------------------------
